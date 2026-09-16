@@ -58,6 +58,10 @@
 **解法**：用 CDP 导航到 `https://www.zhipin.com/web/geek/resume`，
 从 DOM `innerText` 里读「期望职位」段落（含方向、薪资、城市）。
 
+定位时可用 `scripts/debug_resume_expect.py`（在仓库根目录执行）绕过 CLI 直接调平台层，
+用来区分「鉴权链路没注入 stoken」还是「接口本身变了」。该脚本只打印 token 的键名，
+不输出任何凭据原文。
+
 ## 3. 搜索报 code:37 ENVIRONMENT_RISK
 
 连续搜索 4 次以上触发环境风控。**解法**：每次搜索间隔 >3 秒，
