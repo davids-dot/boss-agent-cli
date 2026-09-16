@@ -10,10 +10,18 @@ chat 列表与 friend_list 两次调用拿到的值不同，按 sid 字符串匹
 
 用法
 ----
-    python3 chat_history.py                # 最近 12 个会话
-    python3 chat_history.py --limit 30
-    python3 chat_history.py --name "张"     # 只查姓名包含该串的联系人
-    python3 chat_history.py --json         # 输出 JSON
+    # 用 CLI 自带的解释器跑，省去自己找 sys.path（见下方「解释器」）
+    ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py
+    ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py --limit 30
+    ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py --name "张"
+    ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py --json
+
+解释器
+------
+本脚本借用 boss_agent_cli 的平台层，而它依赖含编译扩展（greenlet、patchright 等）。
+用**与安装 boss-agent-cli 时不同的** Python（例如系统的 python3）跑，会报
+`ModuleNotFoundError: No module named 'greenlet._greenlet'`。此时脚本会给出明确提示，
+按提示改用上面那个解释器即可；也可以 `export BOSS_AGENT_SITE=<site-packages 路径>` 指路。
 
 前置
 ----
@@ -42,8 +50,42 @@ CDP = os.environ.get("BOSS_CDP_URL", "http://localhost:9222")
 DATA_DIR = Path(os.path.expanduser("~/.boss-agent"))
 
 
+def _py_tag() -> str:
+	"""当前解释器的 'pythonX.Y' 标签，用于筛掉 ABI 不匹配的 site-packages。"""
+	return f"python{sys.version_info[0]}.{sys.version_info[1]}"
+
+
+def _site_candidates() -> list[str]:
+	"""可能的 boss_agent_cli 安装位置：BOSS_AGENT_SITE 优先，否则扫 uv tool 目录。"""
+	override = os.environ.get("BOSS_AGENT_SITE")
+	if override:
+		return [override]
+	patterns = [
+		"~/.local/share/uv/tools/boss-agent-cli/lib/python3.*/site-packages",
+		"~/.local/share/uv/tools/boss-agent-cli-*/lib/python3.*/site-packages",
+	]
+	candidates: list[str] = []
+	for pattern in patterns:
+		candidates.extend(glob.glob(os.path.expanduser(pattern)))
+	return candidates
+
+
+def _matching_site(candidates: list[str]) -> str | None:
+	"""只接受与当前解释器同 major.minor 的 site-packages。
+
+	boss_agent_cli 依赖含编译扩展（greenlet、patchright 等）。把别的 Python 版本
+	编译出来的 site-packages 塞进 sys.path 时，`import boss_agent_cli` 往往能过，
+	却在更深一层炸成 `ModuleNotFoundError: No module named 'greenlet._greenlet'`——
+	报错点离真正的病根（解释器版本不一致）很远，让人误以为装坏了。
+	"""
+	tag = _py_tag()
+	usable = [c for c in candidates if tag in Path(c).parts and os.path.isdir(os.path.join(c, "boss_agent_cli"))]
+	usable.sort(reverse=True)
+	return usable[0] if usable else None
+
+
 def _ensure_importable() -> None:
-	"""把 boss_agent_cli 所在的 site-packages 加进 sys.path。
+	"""让 `import boss_agent_cli` 可用。
 
 	本脚本不属于 boss-agent-cli 包，只是借用它的平台层，所以需要自己找包装在哪：
 	优先直接用已安装的环境，其次扫 uv tool 目录，最后允许用 BOSS_AGENT_SITE 指路。
@@ -55,26 +97,30 @@ def _ensure_importable() -> None:
 	except ImportError:
 		pass
 
-	override = os.environ.get("BOSS_AGENT_SITE")
-	candidates = [override] if override else []
-	if not candidates:
-		patterns = [
-			"~/.local/share/uv/tools/boss-agent-cli/lib/python3.*/site-packages",
-			"~/.local/share/uv/tools/boss-agent-cli-*/lib/python3.*/site-packages",
-		]
-		for pattern in patterns:
-			candidates.extend(glob.glob(os.path.expanduser(pattern)))
+	candidates = _site_candidates()
+	site = _matching_site(candidates)
+	if site is None:
+		cur = f"Python {sys.version_info.major}.{sys.version_info.minor}（{sys.executable}）"
+		lines = [f"当前解释器是 {cur}，没有可用的 boss_agent_cli。"]
+		if candidates:
+			lines.append("找到的 boss_agent_cli 属于其它 Python 版本，编译扩展（greenlet 等）与本解释器不兼容：")
+			lines.extend(f"  - {c}" for c in sorted(candidates, reverse=True))
+			lines.append("改用 CLI 自带的解释器运行本脚本（版本必然匹配）：")
+			lines.append("  ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py")
+		else:
+			lines.append("请先安装：uv tool install boss-agent-cli")
+			lines.append("若装在非标准位置，用 BOSS_AGENT_SITE 指向包含 boss_agent_cli 的 site-packages。")
+		raise SystemExit("\n".join(lines))
 
-	candidates.sort(reverse=True)
-	for candidate in candidates:
-		if candidate and os.path.isdir(os.path.join(candidate, "boss_agent_cli")):
-			sys.path.insert(0, candidate)
-			return
-
-	raise SystemExit(
-		"找不到 boss_agent_cli。请先安装：uv tool install boss-agent-cli\n"
-		"若装在非标准位置，用 BOSS_AGENT_SITE 指向包含 boss_agent_cli 的 site-packages。"
-	)
+	sys.path.insert(0, site)
+	try:
+		import boss_agent_cli  # noqa: F401
+	except ImportError as exc:
+		raise SystemExit(
+			f"{site} 里存在 boss_agent_cli，但导入失败：{exc}\n"
+			"多半是编译扩展与当前解释器不兼容，请改用 CLI 自带解释器：\n"
+			"  ~/.local/share/uv/tools/boss-agent-cli/bin/python3 chat_history.py"
+		) from exc
 
 
 def load_chat_list(days: int) -> list[dict]:
@@ -142,6 +188,37 @@ def fetch(limit: int, name_filter: str | None, days: int) -> list[dict]:
 	return results
 
 
+def body_text(m: dict) -> str:
+	"""把一条消息体压成一行可读文本。
+
+	BOSS 的消息体是按类型分的结构化 JSON。type=3 且 body.type==8 的「招呼卡片」里，
+	jobDesc 才是对方在招的岗位（title / salary / city / experience / education）；
+	直接 json.dumps 只会得到一坨被截断的 `{"type": 8, "templateId": 1, ...`，
+	把真正有用的字段埋掉。
+	"""
+	b = m.get("body") if isinstance(m.get("body"), dict) else {}
+	t = m.get("type")
+	if t == 1:
+		return str(b.get("text") or m.get("text") or "")
+	if t == 3:
+		jd = b.get("jobDesc")
+		if b.get("type") == 8 and isinstance(jd, dict):
+			head = " · ".join(str(jd.get(k)) for k in ("title", "salary", "city") if jd.get(k))
+			return f"[招呼卡片] {head}".strip()
+		return str(b.get("text") or m.get("text") or "[打招呼]")
+	if t == 4:
+		return "[简历卡片]"
+	if t == 2:
+		return "[图片]"
+	if t == 9:
+		return f"[表情] {b.get('name') or ''}".strip()
+	if t == 5:
+		return f"[系统] {b.get('text') or m.get('text') or ''}".strip()
+	if t == 6:
+		return f"[名片] {b.get('name') or ''}".strip()
+	return f"[{MSG_TYPE.get(t, f'其他({t})')}]"
+
+
 def render(rows: list[dict]) -> None:
 	for c in rows:
 		print("=" * 92)
@@ -153,16 +230,13 @@ def render(rows: list[dict]) -> None:
 		if c.get("error"):
 			print(f"  !! {c['error']}")
 		for m in c.get("messages") or []:
-			b = m.get("body") if isinstance(m.get("body"), dict) else {}
 			frm = m.get("from") if isinstance(m.get("from"), dict) else {}
 			who = "我" if str((frm or {}).get("uid", "")) != str(c.get("uid")) else "对方"
 			ts = m.get("time")
 			when = datetime.datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M") if ts else ""
 			tname = MSG_TYPE.get(m.get("type"), f"其他({m.get('type')})")
-			txt = (b or {}).get("text") or m.get("text") or ""
-			if not txt:
-				txt = (b or {}).get("name") or (b or {}).get("resumeName") or json.dumps(b or {}, ensure_ascii=False)
-			print(f"  {when}  {who}  <{tname}>  {str(txt).replace(chr(10), ' / ')[:200]}")
+			txt = str(body_text(m)).replace(chr(10), " / ")
+			print(f"  {when}  {who}  <{tname}>  {txt[:200]}")
 		print()
 
 

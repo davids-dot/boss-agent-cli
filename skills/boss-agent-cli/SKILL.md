@@ -18,9 +18,34 @@ boss status                                 # logged_in / auth_state=complete �
 curl -s http://localhost:9222/json/version | head -3   # 确认 Chrome CDP 在线
 ```
 
-- Chrome 必须**带 `--remote-debugging-port=9222` 启动**；Chrome 已在运行且没开 CDP 时，
-  需**先 pkill 再重启**（Electron 单实例限制，不改端口重启无效）
+- Chrome 必须**带 `--remote-debugging-port=9222` 启动**。若用户的 Chrome 已在运行且没开 CDP，
+  **不要 `pkill`** —— 那会关掉他正在用的窗口和标签页。改用**独立 `--user-data-dir`** 另起一个实例，
+  两者互不干扰：
+
+  ```bash
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --remote-debugging-port=9222 \
+    --user-data-dir="$HOME/.boss-agent/chrome-cdp-profile" \
+    --no-first-run --no-default-browser-check \
+    --no-sandbox --disable-gpu --disable-dev-shm-usage \
+    "--remote-allow-origins=*" about:blank
+  ```
+
+  - `--no-sandbox --disable-gpu`：从受限/沙箱化的父进程启动时，Chrome 会因
+    `sandbox initialization failed` 触发 `GPU process isn't usable. Goodbye.` 直接崩，加这两个参数可绕开。
+  - zsh 下 `--remote-allow-origins=*` **必须加引号**，否则报 `no matches found`。
+  - 该实例要常驻；`nohup … &` 在调用方退出后会被回收，请用受管后台任务启动。
 - 数据目录 `~/.boss-agent/`，登录态 `~/.boss-agent/auth/session.enc`
+- **先判断 Cookie 提取链路是否可用再动手**：`boss login` 的自动提取要求浏览器里确实存在
+  `wt2` 与 `__zp_stoken__`。只读查一下（不需要解密 cookie 值）：
+
+  ```bash
+  cp ~/Library/Application\ Support/Google/Chrome/Default/Cookies /tmp/ck.db
+  sqlite3 /tmp/ck.db "select name from cookies where host_key like '%zhipin%';"
+  ```
+
+  若结果里没有 `wt2`，说明浏览器并未登录 BOSS，Cookie 链路必然失败 —— 直接走扫码
+  （`boss login` 或 `boss login --cdp`），别在提取上浪费时间。
 - 未登录时先 `boss login`
 
 ## 常用命令
@@ -60,11 +85,18 @@ boss doctor                   # 环境自检
 
 ```bash
 export BOSS_CDP_URL=http://localhost:9222
-python3 <本技能目录>/scripts/chat_history.py              # 最近 12 个会话
-python3 <本技能目录>/scripts/chat_history.py --limit 30
-python3 <本技能目录>/scripts/chat_history.py --name "张"   # 只查姓名包含该串的
-python3 <本技能目录>/scripts/chat_history.py --json        # 输出 JSON
+BOSS_PY=~/.local/share/uv/tools/boss-agent-cli/bin/python3   # 必须用 CLI 自带解释器，见下
+"$BOSS_PY" <本技能目录>/scripts/chat_history.py              # 最近 12 个会话
+"$BOSS_PY" <本技能目录>/scripts/chat_history.py --limit 30
+"$BOSS_PY" <本技能目录>/scripts/chat_history.py --name "张"   # 只查姓名包含该串的
+"$BOSS_PY" <本技能目录>/scripts/chat_history.py --json        # 输出 JSON
 ```
+
+**别用系统 `python3`。** `boss_agent_cli` 依赖含编译扩展（greenlet、patchright 等），
+用与安装 boss-agent-cli 时不同的 Python 跑会报
+`ModuleNotFoundError: No module named 'greenlet._greenlet'` —— 这个报错点离病根很远，
+容易误判成"装坏了"。脚本检测到版本不匹配时会直接提示该用哪个解释器；
+装在非标准位置时也可 `export BOSS_AGENT_SITE=<含 boss_agent_cli 的 site-packages>` 指路。
 
 脚本原理（要自己实现时照抄）：
 
@@ -73,8 +105,13 @@ python3 <本技能目录>/scripts/chat_history.py --json        # 输出 JSON
    同名时用 `encryptJobId` 消歧
 3. `chat_history(gid=uid, securityId=friend_list 返回的 sid, count=50)` → `zpData.messages`
 4. 消息 `type`：1文本 2图片 3招呼 4简历 5系统 6名片 7语音 8视频 9表情；
-   `from.uid != gid` 是自己发的
-5. 每个会话之间 `sleep 2.5s` 控频，避免 `code:37` 风控
+   `from.uid != gid` 是自己发的。注意 `type=4`「简历卡片」在数据里 `from` 是**对方**，
+   不要当成本人发出的简历
+5. **对方在招的岗位藏在招呼卡片里**：`type=3` 且 `body.type==8` 的消息，
+   `body.jobDesc` 含 `title` / `salary` / `city` / `experience` / `education`，
+   `body.jobDesc.bottomText` 记着发起时间与方向。`boss chat` 返回的 `title` 是招聘者
+   **自己的头衔**（CEO、招聘总监…），不是岗位名，两者别混淆
+6. 每个会话之间 `sleep 2.5s` 控频，避免 `code:37` 风控
 
 > 上游已有修复（按 uid 匹配 + 用本次返回的 securityId）。若你装的版本里
 > `boss chat` 已输出 `uid`，直接 `boss chatmsg <uid>` 即可，不再需要脚本。
@@ -90,6 +127,11 @@ python3 <本技能目录>/scripts/chat_history.py --json        # 输出 JSON
 | 拿不到常用语 | CLI 无此命令；CDP 打开 `https://www.zhipin.com/web/geek/chat` 读重复发送的消息 |
 | 发附件简历 | CLI 无此命令（只有招聘者侧）；需在网页聊天界面用 CDP 操作 |
 | 改了源码不生效 | 全局 `boss` 走 uv **tool** 环境，与项目 `.venv` 是两套；验证改动要用对应环境的入口 |
+| `chat_history.py` 报 `No module named 'greenlet._greenlet'` | 用了别的 Python 解释器；改用 `~/.local/share/uv/tools/boss-agent-cli/bin/python3` |
+| Chrome 启动即崩，日志里有 `GPU process isn't usable. Goodbye.` | 受限环境下 Chrome 沙箱起不来；加 `--no-sandbox --disable-gpu` 重启 |
+| `boss login --cdp` 报 `CDP_UNAVAILABLE` | 多半是 Chrome 进程已经退出；先 `curl -s http://localhost:9222/json/version` 确认 |
+| zsh 下传 `--remote-allow-origins=*` 报 `no matches found` | shell 把 `*` 当通配符展开；给整个参数加引号 |
+| `boss chat` 里找不到 `last_message` 字段 | 字段名是 `last_msg`；`--no-json` 也不存在，子命令只输出 JSON |
 
 完整证据链与排查过程见 `references/pitfalls.md`。
 
